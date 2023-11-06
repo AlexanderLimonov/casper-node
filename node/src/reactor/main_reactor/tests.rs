@@ -8,42 +8,38 @@ use tempfile::TempDir;
 use tokio::time;
 use tracing::{error, info};
 
-use casper_execution_engine::core::engine_state::GetBidsRequest;
-use casper_types::{
-    system::auction::{Bids, DelegationRate},
-    testing::TestRng,
-    EraId, Motes, ProtocolVersion, PublicKey, SecretKey, TimeDiff, Timestamp, U512,
-};
+use casper_execution_engine::core::engine_state::{Error, GetBidsRequest, QueryRequest, QueryResult};
+use casper_execution_engine::core::engine_state::QueryResult::{CircularReference, DepthLimit, Success, ValueNotFound};
+use casper_storage::global_state::shared::CorrelationId;
+use casper_types::{system::auction::{Bids, DelegationRate}, testing::TestRng, EraId, Motes, ProtocolVersion, PublicKey, SecretKey, TimeDiff, Timestamp, U512, ContractHash};
+use casper_types::system::mint;
 
-use crate::{
-    components::{
-        consensus::{
-            self, ClContext, ConsensusMessage, HighwayMessage, HighwayVertex, NewBlockPayload,
-        },
-        gossiper, network, storage,
-        upgrade_watcher::NextUpgrade,
+use crate::{components::{
+    consensus::{
+        self, ClContext, ConsensusMessage, HighwayMessage, HighwayVertex, NewBlockPayload,
     },
-    effect::{
-        incoming::ConsensusMessageIncoming,
-        requests::{ContractRuntimeRequest, NetworkRequest},
-        EffectExt,
-    },
-    protocol::Message,
-    reactor::{
-        main_reactor::{Config, MainEvent, MainReactor, ReactorState},
-        Runner,
-    },
-    testing::{
-        self, filter_reactor::FilterReactor, network::TestingNetwork, ConditionCheckReactor,
-    },
-    types::{
-        chainspec::{AccountConfig, AccountsConfig, ValidatorConfig},
-        ActivationPoint, BlockHeader, BlockPayload, Chainspec, ChainspecRawBytes, Deploy, ExitCode,
-        NodeRng,
-    },
-    utils::{External, Loadable, Source, RESOURCES_PATH},
-    WithDir,
-};
+    gossiper, network, storage,
+    upgrade_watcher::NextUpgrade,
+}, effect::{
+    incoming::ConsensusMessageIncoming,
+    requests::{ContractRuntimeRequest, NetworkRequest},
+    EffectExt,
+}, fatal, protocol::Message, reactor::{
+    main_reactor::{Config, MainEvent, MainReactor, ReactorState},
+    Runner,
+}, reactor, testing::{
+    self, filter_reactor::FilterReactor, network::TestingNetwork, ConditionCheckReactor,
+}, types::{
+    chainspec::{AccountConfig, AccountsConfig, ValidatorConfig},
+    ActivationPoint, BlockHeader, BlockPayload, Chainspec, ChainspecRawBytes, Deploy, ExitCode,
+    NodeRng,
+}, utils::{External, Loadable, Source, RESOURCES_PATH}, WithDir};
+use crate::components::{block_accumulator, block_synchronizer, Component, deploy_buffer, event_stream_server, shutdown_trigger};
+use crate::components::gossiper::GossipItem;
+use crate::components::network::Event;
+use crate::effect::{EffectBuilder, Effects};
+use crate::effect::announcements::MetaBlockAnnouncement;
+use crate::types::MetaBlock;
 
 struct TestChain {
     // Keys that validator instances will use, can include duplicates
@@ -88,14 +84,13 @@ impl TestChain {
                 (PublicKey::from(&*secret_key), stake)
             })
             .collect();
-        Self::new_with_keys(rng, keys, stakes)
+        Self::new_with_keys(keys, stakes)
     }
 
     /// Instantiates a new test chain configuration.
     ///
     /// Takes a vector of bonded keys with specified bond amounts.
     fn new_with_keys(
-        rng: &mut TestRng,
         keys: Vec<Arc<SecretKey>>,
         stakes: BTreeMap<PublicKey, U512>,
     ) -> Self {
@@ -104,6 +99,7 @@ impl TestChain {
             <(Chainspec, ChainspecRawBytes)>::from_resources("local");
 
         // Override accounts with those generated from the keys.
+        // TODO: This needs more flexibility to define users and delegators
         let accounts = stakes
             .into_iter()
             .map(|(public_key, bonded_amount)| {
@@ -111,7 +107,7 @@ impl TestChain {
                     ValidatorConfig::new(Motes::new(bonded_amount), DelegationRate::zero());
                 AccountConfig::new(
                     public_key,
-                    Motes::new(U512::from(rng.gen_range(10000..99999999))),
+                    Motes::new(U512::zero()),
                     Some(validator_config),
                 )
             })
@@ -370,7 +366,7 @@ async fn run_equivocator_network() {
 
     // We configure the era to take ten rounds. That should guarantee that the two nodes
     // equivocate.
-    let mut chain = TestChain::new_with_keys(&mut rng, keys, stakes.clone());
+    let mut chain = TestChain::new_with_keys(keys, stakes.clone());
     chain.chainspec_mut().core_config.minimum_era_height = 10;
     chain.chainspec_mut().highway_config.maximum_round_length =
         chain.chainspec.core_config.minimum_block_time * 2;
@@ -681,7 +677,7 @@ async fn should_store_finalized_approvals() {
         iter::once((alice_public_key.clone(), U512::from(100))).collect();
 
     // Eras have exactly two blocks each, and there is one block per second.
-    let mut chain = TestChain::new_with_keys(&mut rng, keys, stakes.clone());
+    let mut chain = TestChain::new_with_keys(keys, stakes.clone());
     chain.chainspec_mut().core_config.minimum_era_height = 2;
     chain.chainspec_mut().core_config.era_duration = TimeDiff::from_millis(0);
     chain.chainspec_mut().core_config.minimum_block_time = "1second".parse().unwrap();
@@ -845,7 +841,7 @@ async fn empty_block_validation_regression() {
         .collect();
 
     // We make the first validator always accuse everyone else.
-    let mut chain = TestChain::new_with_keys(&mut rng, keys, stakes.clone());
+    let mut chain = TestChain::new_with_keys(keys, stakes.clone());
     chain.chainspec_mut().core_config.minimum_block_time = "1second".parse().unwrap();
     chain.chainspec_mut().highway_config.maximum_round_length = "1second".parse().unwrap();
     chain.chainspec_mut().core_config.minimum_era_height = 15;
@@ -913,4 +909,403 @@ async fn empty_block_validation_regression() {
         [inactive_validator] if malicious_validator == *inactive_validator => {}
         inactive => panic!("unexpected inactive validators: {:?}", inactive),
     }
+}
+
+fn handle_meta_block_without_signing(
+    filtered_reactor: &mut MainReactor,
+    effect_builder: EffectBuilder<MainEvent>,
+    rng: &mut NodeRng,
+    MetaBlock {
+        block,
+        execution_results,
+        mut state,
+    }: MetaBlock,
+) -> Effects<MainEvent> {
+    if !state.is_stored() {
+        return fatal!(
+                effect_builder,
+                "MetaBlock: block should be stored after execution or accumulation"
+            )
+            .ignore();
+    }
+
+    let mut effects = Effects::new();
+
+    if state.register_as_sent_to_deploy_buffer().was_updated() {
+        effects.extend(reactor::wrap_effects(
+            MainEvent::DeployBuffer,
+            filtered_reactor.deploy_buffer.handle_event(
+                effect_builder,
+                rng,
+                deploy_buffer::Event::Block(Arc::clone(&block)),
+            ),
+        ));
+    }
+
+    if state.register_updated_validator_matrix().was_updated() {
+        if let Some(validator_weights) = block.header().next_era_validator_weights() {
+            let era_id = block.header().era_id();
+            let next_era_id = era_id.successor();
+
+            effects.extend(filtered_reactor.update_validator_weights(
+                effect_builder,
+                rng,
+                next_era_id,
+                validator_weights.clone(),
+            ));
+        }
+    }
+
+    // Validators gossip the block as soon as they deem it valid, but non-validators
+    // only gossip once the block is marked complete.
+    if let Some(true) = filtered_reactor
+        .validator_matrix
+        .is_self_validator_in_era(block.header().era_id())
+    {
+
+        filtered_reactor.update_meta_block_gossip_state(
+            effect_builder,
+            rng,
+            block.hash(),
+            block.gossip_target(),
+            &mut state,
+            &mut effects,
+        );
+    }
+
+    if !state.is_executed() {
+        // We've done as much as we can on a valid but un-executed block.
+        return effects;
+    }
+
+    if state.register_we_have_tried_to_sign().was_updated() { /*
+        // When this node is a validator in this era, sign and announce.
+        if let Some(finality_signature) = filtered_reactor
+            .validator_matrix
+            .create_finality_signature(block.header())
+        {
+
+            effects.extend(reactor::wrap_effects(
+                MainEvent::Storage,
+                effect_builder
+                    .put_finality_signature_to_storage(finality_signature.clone())
+                    .ignore(),
+            ));
+
+            effects.extend(reactor::wrap_effects(
+                MainEvent::BlockAccumulator,
+                filtered_reactor.block_accumulator.handle_event(
+                    effect_builder,
+                    rng,
+                    block_accumulator::Event::CreatedFinalitySignature {
+                        finality_signature: Box::new(finality_signature.clone()),
+                    },
+                ),
+            ));
+
+            let era_id = finality_signature.era_id;
+            let payload = Message::FinalitySignature(Box::new(finality_signature));
+            effects.extend(reactor::wrap_effects(
+                MainEvent::Network,
+                effect_builder
+                    .broadcast_message_to_validators(payload, era_id)
+                    .ignore(),
+            ));
+        }*/
+    }
+
+    if state.register_as_consensus_notified().was_updated() {
+        effects.extend(reactor::wrap_effects(
+            MainEvent::Consensus,
+            filtered_reactor.consensus.handle_event(
+                effect_builder,
+                rng,
+                consensus::Event::BlockAdded {
+                    header: Box::new(block.header().clone()),
+                    header_hash: *block.hash(),
+                },
+            ),
+        ));
+    }
+
+    if state.register_as_accumulator_notified().was_updated() {
+        let meta_block = MetaBlock {
+            block,
+            execution_results,
+            state,
+        };
+        effects.extend(reactor::wrap_effects(
+            MainEvent::BlockAccumulator,
+            filtered_reactor.block_accumulator.handle_event(
+                effect_builder,
+                rng,
+                block_accumulator::Event::ExecutedBlock { meta_block },
+            ),
+        ));
+        // We've done as much as we can for now, we need to wait for the block
+        // accumulator to mark the block complete before proceeding further.
+        return effects;
+    }
+
+    // Set the current switch block only after the block is marked complete.
+    // We *always* want to initialize the contract runtime with the highest complete block.
+    // In case of an upgrade, we want the reactor to hold off in the `Upgrading` state until
+    // the immediate switch block is stored and *also* marked complete.
+    // This will allow the contract runtime to initialize properly (see
+    // [`refresh_contract_runtime`]) when the reactor is transitioning from `CatchUp` to
+    // `KeepUp`.
+    if state.is_marked_complete() {
+        if block.header().is_switch_block() {
+            match filtered_reactor
+                .switch_block_header
+                .as_ref()
+                .map(|header| header.height())
+            {
+                Some(current_height) => {
+                    if block.height() > current_height {
+                        filtered_reactor.switch_block_header = Some(block.header().clone());
+                    }
+                }
+                None => {
+                    filtered_reactor.switch_block_header = Some(block.header().clone());
+                }
+            }
+        } else {
+            filtered_reactor.switch_block_header = None;
+        }
+    } else {
+        error!(
+                block = %*block,
+                ?state,
+                "should be a complete block after passing to accumulator"
+            );
+    }
+
+    filtered_reactor.update_meta_block_gossip_state(
+        effect_builder,
+        rng,
+        block.hash(),
+        block.gossip_target(),
+        &mut state,
+        &mut effects,
+    );
+
+    if state.register_as_synchronizer_notified().was_updated() {
+        effects.extend(reactor::wrap_effects(
+            MainEvent::BlockSynchronizer,
+            filtered_reactor.block_synchronizer.handle_event(
+                effect_builder,
+                rng,
+                block_synchronizer::Event::MarkBlockExecuted(*block.hash()),
+            ),
+        ));
+    }
+
+    if state.register_all_actions_done().was_already_registered() {
+        error!(
+                block = %*block,
+                ?state,
+                "duplicate meta block announcement emitted"
+            );
+        return effects;
+    }
+
+    effects.extend(reactor::wrap_effects(
+        MainEvent::EventStreamServer,
+        filtered_reactor.event_stream_server.handle_event(
+            effect_builder,
+            rng,
+            event_stream_server::Event::BlockAdded(Arc::clone(&block)),
+        ),
+    ));
+
+    for (deploy_hash, deploy_header, execution_result) in execution_results {
+        let event = event_stream_server::Event::DeployProcessed {
+            deploy_hash,
+            deploy_header: Box::new(deploy_header),
+            block_hash: *block.hash(),
+            execution_result: Box::new(execution_result),
+        };
+        effects.extend(reactor::wrap_effects(
+            MainEvent::EventStreamServer,
+            filtered_reactor.event_stream_server
+                .handle_event(effect_builder, rng, event),
+        ));
+    }
+
+    effects.extend(reactor::wrap_effects(
+        MainEvent::ShutdownTrigger,
+        filtered_reactor.shutdown_trigger.handle_event(
+            effect_builder,
+            rng,
+            shutdown_trigger::Event::CompletedBlock(Arc::clone(&block)),
+        ),
+    ));
+    effects
+}
+
+#[tokio::test]
+async fn basic_simple_rewards_test() {
+    testing::init_logging();
+
+    // Constants to "parametrize" the test
+    const NETWORK_SIZE: u64 = 5;
+    const STAKE: u64 = 1000000000;
+    const ERA_COUNT: u64 = 3;
+    const ERA_DURATION: u64 = 30000; //milliseconds
+    const MIN_HEIGHT: u64 = 10;
+    const BLOCK_TIME: u64 = 3000; //milliseconds
+    const TIME_OUT: u64 = 3000; //seconds
+    const SEIGNIORAGE: (u64, u64) = (1u64, 100u64);
+    const FINALITY_SIG_PROP: (u64, u64) = (1u64, 1u64);
+
+    // SETUP
+    // TODO: Consider fixing the seed
+    let mut rng = crate::new_rng();
+
+    // Create random keypairs to populate our network
+    let keys: Vec<Arc<SecretKey>> = (1..NETWORK_SIZE + 1)
+        .map(|_| Arc::new(SecretKey::random(&mut rng)))
+        .collect();
+    let stakes: BTreeMap<PublicKey, U512> = keys
+        .iter()
+        .map(|secret_key| (PublicKey::from(&*secret_key.clone()), U512::from(STAKE)))
+        .collect();
+
+    // Instantiate the chain
+    let mut chain = TestChain::new_with_keys(keys, stakes.clone());
+
+    chain.chainspec_mut().core_config.era_duration = TimeDiff::from_millis(ERA_DURATION);
+    chain.chainspec_mut().core_config.minimum_era_height = MIN_HEIGHT;
+    chain.chainspec_mut().core_config.minimum_block_time = TimeDiff::from_millis(BLOCK_TIME);
+    chain.chainspec_mut().core_config.round_seigniorage_rate = Ratio::from(SEIGNIORAGE);
+    chain.chainspec_mut().core_config.finality_signature_proportion = Ratio::from(FINALITY_SIG_PROP);
+
+    let mut net = chain
+        .create_initialized_network(&mut rng)
+        .await
+        .expect("network initialization failed");
+
+    let bad_node = net.runners_mut().nth(0).unwrap();
+
+    // Set the bad node to forget signing blocks
+
+    bad_node
+    .reactor_mut()
+    .inner_mut()
+    .set_filter(|event| match &event {
+        /*
+        // If we were about to broadcast a finality signature we just created, do nothing instead
+        MainEvent::Network(net_event) => {
+            info!{"======GENERIC NETWORK EVENT {}===========", &net_event}
+            match net_event {
+                Event::NetworkRequest {req} =>
+                    match &**req {
+                        NetworkRequest::ValidatorBroadcast {payload, era_id: _, auto_closing_responder: _} =>
+                            {info!{"=========WAS ABOUT TO BROADCAST (INNER)========"}
+                            match **payload {
+                                Message::FinalitySignature(_) => {
+                                    info!{"=========WAS ABOUT TO BROADCAST FINALITY SIGNATURE========"}
+                                    Either::Left(Effects::new())},
+                                _ => Either::Right(event),
+                            }},
+                        _ => Either::Right(event),
+                    },
+                _ => Either::Right(event),
+            }},
+        MainEvent::NetworkRequest(
+            NetworkRequest::SendMessage { payload, .. }
+          | NetworkRequest::ValidatorBroadcast { payload, .. }
+          | NetworkRequest::Gossip { payload, .. },
+        ) if matches!(**payload, Message::FinalitySignature(_)) => {
+            info!{"=========WAS ABOUT TO COMMUNICATE ABOUT FINALITY SIGNATURE========"}
+            Either::Left(Effects::new())},*/
+        MainEvent::MetaBlockAnnouncement(MetaBlockAnnouncement(/*MetaBlock {block, execution_results, state, }*/meta_block)) =>
+            /*
+            let meta_block = MetaBlock {
+                block,
+                execution_results,
+                state,
+            };*/
+            Either::Left(handle_meta_block_without_signing(&mut bad_node.main_reactor(), bad_node.effect_builder(), &mut NodeRng::new(), meta_block.clone())),
+        _ => Either::Right(event),
+    });
+
+    // Run the network for a specified number of eras
+    // TODO: Consider replacing era duration estimate with actual chainspec value
+    let timeout = Duration::from_secs(TIME_OUT);
+    net.settle_on(
+        &mut rng,
+        has_completed_era(EraId::new(ERA_COUNT - 1)),
+        timeout)
+        .await;
+
+    // DATA COLLECTION
+    // Get the switch blocks and bid structs first
+    let switch_blocks = SwitchBlocks::collect(net.nodes(), ERA_COUNT);
+    let bids: Vec<Bids> = (0..ERA_COUNT)
+        .map(|era_number| switch_blocks.bids(net.nodes(), era_number))
+        .collect();
+/*
+    // Representative node
+    // (this test should normally run a network at nominal performance with identical nodes)
+    let representative_node = net.nodes().values().next().unwrap();
+    let representative_storage = &representative_node.main_reactor().storage;
+    let representative_runtime = &representative_node.main_reactor().contract_runtime;
+
+    // Recover highest completed block height
+    let highest_completed_height = representative_storage
+        .highest_complete_block_height()
+        .expect("missing highest completed block");
+
+    // Recover history of total supply
+    let mint_hash: ContractHash = {
+        let any_state_hash = *switch_blocks.headers[0].state_root_hash();
+        representative_runtime
+            .engine_state()
+            .get_system_mint_hash(CorrelationId::new(), any_state_hash)
+            .expect("mint contract hash not found")
+    };
+
+    // Get total supply history
+    let total_supply: Vec<U512> = (0..highest_completed_height + 1)
+        .map(|height: u64| {
+            let state_hash = *representative_storage
+                .read_block_header_by_height(height, true)
+                .expect("failure to read block header")
+                .unwrap()
+                .state_root_hash();
+
+            let request = QueryRequest::new(
+                state_hash.clone(),
+                mint_hash.into(),
+                vec![mint::TOTAL_SUPPLY_KEY.to_owned()],
+            );
+
+            representative_runtime
+                .engine_state()
+                .run_query(CorrelationId::new(), request)
+                .and_then(move |query_result| match query_result {
+                    Success { value, proofs: _ } => value
+                        .as_cl_value()
+                        .ok_or_else(|| Error::Mint("Value not a CLValue".to_owned()))?
+                        .clone()
+                        .into_t::<U512>()
+                        .map_err(|e| Error::Mint(format!("CLValue not a U512: {e}"))),
+                    ValueNotFound(s) => Err(Error::Mint(format!("ValueNotFound({s})"))),
+                    CircularReference(s) => Err(Error::Mint(format!("CircularReference({s})"))),
+                    DepthLimit { depth } => Err(Error::Mint(format!("DepthLimit({depth})"))),
+                    QueryResult::RootNotFound => Err(Error::RootNotFound(state_hash)),
+                })
+                .expect("failure to recover total supply")
+        })
+        .collect();
+*/
+    // Verify that it "works"
+    // TODO: Make this more interesting
+    for entry in &bids[ERA_COUNT as usize - 1] {
+        let (_, bid) = entry;
+        assert!(bid.staked_amount() > &U512::from(STAKE), "expected an increase in stakes");
+    }
+
 }

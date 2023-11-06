@@ -235,7 +235,7 @@ pub(crate) async fn rewards_for_era<REv: ReactorEventT>(
                 .height()
                 .saturating_sub(chainspec.core_config.signature_rewards_max_delay)
         };
-        let range_to_fetch = cited_block_height_start..switch_block_height;
+        let range_to_fetch = cited_block_height_start..switch_block_height+1;
 
         let result = collect_past_blocks_batched(effect_builder, range_to_fetch.clone()).await;
 
