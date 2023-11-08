@@ -64,7 +64,6 @@ use crate::{
         requests::ChainspecRawBytesRequest,
         EffectBuilder, EffectExt, Effects, GossipTarget,
     },
-    failpoints::FailpointActivation,
     fatal,
     protocol::Message,
     reactor::{
@@ -73,6 +72,7 @@ use crate::{
         main_reactor::{fetchers::Fetchers, upgrade_shutdown::SignatureGossipTracker},
         EventQueueHandle, QueueKind,
     },
+    failpoints::FailpointActivation,
     types::{
         Block, BlockHash, BlockHeader, Chainspec, ChainspecRawBytes, Deploy, FinalitySignature,
         MetaBlock, MetaBlockState, TrieOrChunk, ValidatorMatrix,
@@ -190,6 +190,8 @@ pub(crate) struct MainReactor {
     control_logic_default_delay: TimeDiff,
     sync_to_genesis: bool,
     signature_gossip_tracker: SignatureGossipTracker,
+
+    finality_signature_creation: bool,
 }
 
 impl reactor::Reactor for MainReactor {
@@ -239,7 +241,7 @@ impl reactor::Reactor for MainReactor {
                 req.0.respond((self.state, self.last_progress)).ignore()
             }
             MainEvent::MetaBlockAnnouncement(MetaBlockAnnouncement(meta_block)) => {
-                self.handle_meta_block(effect_builder, rng, meta_block)
+                self.handle_meta_block(effect_builder, rng, self.finality_signature_creation, meta_block)
             }
             MainEvent::UnexecutedBlockAnnouncement(UnexecutedBlockAnnouncement(block_height)) => {
                 let only_from_available_block_range = true;
@@ -1167,6 +1169,7 @@ impl reactor::Reactor for MainReactor {
             switch_block_header: None,
             sync_to_genesis: config.node.sync_to_genesis,
             signature_gossip_tracker: SignatureGossipTracker::new(),
+            finality_signature_creation: true,
         };
         info!("MainReactor: instantiated");
         let effects = effect_builder
@@ -1187,6 +1190,9 @@ impl reactor::Reactor for MainReactor {
                 &mut self.consensus,
                 activation,
             );
+        }
+        if activation.key().starts_with("finality_signature_creation") {
+            self.finality_signature_creation = false;
         }
     }
 }
@@ -1220,6 +1226,7 @@ impl MainReactor {
         &mut self,
         effect_builder: EffectBuilder<MainEvent>,
         rng: &mut NodeRng,
+        create_finality_signatures: bool,
         MetaBlock {
             block,
             execution_results,
@@ -1309,7 +1316,7 @@ impl MainReactor {
             return effects;
         }
 
-        if state.register_we_have_tried_to_sign().was_updated() {
+        if state.register_we_have_tried_to_sign().was_updated() && create_finality_signatures {
             // When this node is a validator in this era, sign and announce.
             if let Some(finality_signature) = self
                 .validator_matrix

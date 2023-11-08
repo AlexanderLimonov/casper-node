@@ -8,13 +8,8 @@ use futures::future::BoxFuture;
 use prometheus::Registry;
 
 use super::network::NetworkedReactor;
-use crate::{
-    components::network::Identity as NetworkIdentity,
-    effect::{EffectBuilder, Effects},
-    reactor::{EventQueueHandle, Finalize, Reactor},
-    types::{Chainspec, ChainspecRawBytes, NodeId},
-    NodeRng,
-};
+use crate::{components::network::Identity as NetworkIdentity, effect::{EffectBuilder, Effects}, reactor::{EventQueueHandle, Finalize, Reactor}, types::{Chainspec, ChainspecRawBytes, NodeId}, NodeRng,
+    failpoints::FailpointActivation};
 
 pub(crate) trait EventFilter<Ev>:
     FnMut(Ev) -> Either<Effects<Ev>, Ev> + Send + 'static
@@ -39,6 +34,12 @@ impl<R: Reactor> FilterReactor<R> {
     /// Returns a reference to the wrapped reactor.
     pub(crate) fn inner(&self) -> &R {
         &self.reactor
+    }
+
+    /// Activate failpoint disabling finality signature creation
+    pub(crate) fn activate_finality_signature_creation_failpoint(&mut self) {
+        let activation = FailpointActivation::new("finality_signature_creation");
+        self.reactor.activate_failpoint(&activation);
     }
 }
 

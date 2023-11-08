@@ -1220,6 +1220,7 @@ async fn basic_simple_rewards_test() {
         let filtered_node = net.runners_mut().nth(*i).unwrap();
         let sender_public_key = filtered_node.main_reactor().consensus().public_key();
 
+        /*
         let filter_closure =
             |event| match &event {
                 /*
@@ -1246,8 +1247,9 @@ async fn basic_simple_rewards_test() {
                 }
                 _ => Either::Right(event),
             };
-
-        filtered_node.reactor_mut().inner_mut().set_filter(filter_closure);
+        */
+        //filtered_node.reactor_mut().inner_mut().set_filter(filter_closure);
+        filtered_node.reactor_mut().inner_mut().activate_finality_signature_creation_failpoint();
     }
 
     // Run the network for a specified number of eras
