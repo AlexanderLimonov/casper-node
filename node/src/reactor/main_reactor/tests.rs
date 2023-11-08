@@ -36,10 +36,8 @@ use crate::{components::{
 }, utils::{External, Loadable, Source, RESOURCES_PATH}, WithDir};
 use crate::components::{block_accumulator, block_synchronizer, Component, deploy_buffer, event_stream_server, shutdown_trigger};
 use crate::components::gossiper::GossipItem;
-use crate::components::network::Event;
 use crate::effect::{EffectBuilder, Effects};
-use crate::effect::announcements::MetaBlockAnnouncement;
-use crate::types::MetaBlock;
+use crate::types::{BlockWithMetadata, MetaBlock};
 
 struct TestChain {
     // Keys that validator instances will use, can include duplicates
@@ -1149,7 +1147,8 @@ async fn basic_simple_rewards_test() {
     testing::init_logging();
 
     // Constants to "parametrize" the test
-    const NETWORK_SIZE: u64 = 5;
+    const VALIDATOR_SLOTS: u32 = 10;
+    const NETWORK_SIZE: u64 = 10;
     const STAKE: u64 = 1000000000;
     const ERA_COUNT: u64 = 3;
     const ERA_DURATION: u64 = 30000; //milliseconds
@@ -1157,7 +1156,10 @@ async fn basic_simple_rewards_test() {
     const BLOCK_TIME: u64 = 3000; //milliseconds
     const TIME_OUT: u64 = 3000; //seconds
     const SEIGNIORAGE: (u64, u64) = (1u64, 100u64);
+    const FINDERS_FEE: (u64, u64) = (0u64, 1u64);
     const FINALITY_SIG_PROP: (u64, u64) = (1u64, 1u64);
+    const REPRESENTATIVE_NODE_INDEX: usize = 0;
+    const FILTERED_NODES_INDICES: &'static [usize] = &[3, 4];
 
     // SETUP
     // TODO: Consider fixing the seed
@@ -1175,61 +1177,78 @@ async fn basic_simple_rewards_test() {
     // Instantiate the chain
     let mut chain = TestChain::new_with_keys(keys, stakes.clone());
 
+    chain.chainspec_mut().core_config.validator_slots = VALIDATOR_SLOTS;
     chain.chainspec_mut().core_config.era_duration = TimeDiff::from_millis(ERA_DURATION);
     chain.chainspec_mut().core_config.minimum_era_height = MIN_HEIGHT;
     chain.chainspec_mut().core_config.minimum_block_time = TimeDiff::from_millis(BLOCK_TIME);
     chain.chainspec_mut().core_config.round_seigniorage_rate = Ratio::from(SEIGNIORAGE);
+    chain.chainspec_mut().core_config.finders_fee = Ratio::from(FINDERS_FEE);
     chain.chainspec_mut().core_config.finality_signature_proportion = Ratio::from(FINALITY_SIG_PROP);
 
     let mut net = chain
         .create_initialized_network(&mut rng)
         .await
         .expect("network initialization failed");
-
+/*
     let bad_node = net.runners_mut().nth(0).unwrap();
+    let sender_public_key = bad_node.main_reactor().consensus().public_key();
+
+    let filter_closure_2 =
+        |event| match &event {
+            // If we were about to broadcast a finality signature we just created, do nothing instead
+            MainEvent::NetworkRequest(
+                NetworkRequest::SendMessage { payload, .. }
+                | NetworkRequest::ValidatorBroadcast { payload, .. }
+                | NetworkRequest::Gossip { payload, .. },
+            ) =>
+                match &**payload {
+                    Message::FinalitySignature(inner) if matches!(&inner.public_key, sender_public_key) => {
+                        info!{"\n=========WAS ABOUT TO COMMUNICATE A FINALITY SIGNATURE========\nEVENT {}\nPAYLOAD {}", event, payload}
+                        Either::Left(Effects::new())}
+                    _ => Either::Right(event),
+                }
+            _ => Either::Right(event),
+        };
 
     // Set the bad node to forget signing blocks
-
     bad_node
     .reactor_mut()
     .inner_mut()
-    .set_filter(|event| match &event {
-        /*
-        // If we were about to broadcast a finality signature we just created, do nothing instead
-        MainEvent::Network(net_event) => {
-            info!{"======GENERIC NETWORK EVENT {}===========", &net_event}
-            match net_event {
-                Event::NetworkRequest {req} =>
-                    match &**req {
-                        NetworkRequest::ValidatorBroadcast {payload, era_id: _, auto_closing_responder: _} =>
-                            {info!{"=========WAS ABOUT TO BROADCAST (INNER)========"}
-                            match **payload {
-                                Message::FinalitySignature(_) => {
-                                    info!{"=========WAS ABOUT TO BROADCAST FINALITY SIGNATURE========"}
-                                    Either::Left(Effects::new())},
-                                _ => Either::Right(event),
-                            }},
+    .set_filter(filter_closure_2);
+*/
+    for i in FILTERED_NODES_INDICES {
+        let filtered_node = net.runners_mut().nth(*i).unwrap();
+        let sender_public_key = filtered_node.main_reactor().consensus().public_key();
+
+        let filter_closure =
+            |event| match &event {
+                /*
+                MainEvent::Network(inner_event) =>
+                    {
+                        info!{"\n=========GENERIC NETWORK========\nMESSAGE {}", inner_event}
+                        Either::Right(event)
+                    }*/
+                // If we were about to broadcast a finality signature we just created, do nothing instead
+                MainEvent::NetworkRequest(
+                    NetworkRequest::SendMessage { payload, .. }
+                    | NetworkRequest::ValidatorBroadcast { payload, .. }
+                    | NetworkRequest::Gossip { payload, .. },
+                ) => {
+                    info!{"\n=========NETWORK REQUEST========\nPAYLOAD {}", &payload}
+                    match &**payload {
+                        Message::FinalitySignature(..)
+                        | Message::FinalitySignatureGossiper(..) /*if matches!(&inner.public_key, sender_public_key)*/ => {
+                            info! {"\n=========WAS ABOUT TO COMMUNICATE A FINALITY SIGNATURE========\nEVENT {}\nPAYLOAD {}", event, payload}
+                            Either::Left(Effects::new())
+                        }
                         _ => Either::Right(event),
-                    },
+                    }
+                }
                 _ => Either::Right(event),
-            }},
-        MainEvent::NetworkRequest(
-            NetworkRequest::SendMessage { payload, .. }
-          | NetworkRequest::ValidatorBroadcast { payload, .. }
-          | NetworkRequest::Gossip { payload, .. },
-        ) if matches!(**payload, Message::FinalitySignature(_)) => {
-            info!{"=========WAS ABOUT TO COMMUNICATE ABOUT FINALITY SIGNATURE========"}
-            Either::Left(Effects::new())},*/
-        MainEvent::MetaBlockAnnouncement(MetaBlockAnnouncement(/*MetaBlock {block, execution_results, state, }*/meta_block)) =>
-            /*
-            let meta_block = MetaBlock {
-                block,
-                execution_results,
-                state,
-            };*/
-            Either::Left(handle_meta_block_without_signing(&mut bad_node.main_reactor(), bad_node.effect_builder(), &mut NodeRng::new(), meta_block.clone())),
-        _ => Either::Right(event),
-    });
+            };
+
+        filtered_node.reactor_mut().inner_mut().set_filter(filter_closure);
+    }
 
     // Run the network for a specified number of eras
     // TODO: Consider replacing era duration estimate with actual chainspec value
@@ -1246,10 +1265,10 @@ async fn basic_simple_rewards_test() {
     let bids: Vec<Bids> = (0..ERA_COUNT)
         .map(|era_number| switch_blocks.bids(net.nodes(), era_number))
         .collect();
-/*
+
     // Representative node
     // (this test should normally run a network at nominal performance with identical nodes)
-    let representative_node = net.nodes().values().next().unwrap();
+    let representative_node = net.nodes().values().nth(REPRESENTATIVE_NODE_INDEX).unwrap();
     let representative_storage = &representative_node.main_reactor().storage;
     let representative_runtime = &representative_node.main_reactor().contract_runtime;
 
@@ -1257,6 +1276,12 @@ async fn basic_simple_rewards_test() {
     let highest_completed_height = representative_storage
         .highest_complete_block_height()
         .expect("missing highest completed block");
+
+    // Get all the blocks
+    let blocks: Vec<BlockWithMetadata> =
+        (0..highest_completed_height + 1).map(
+            |i| representative_storage.read_block_and_metadata_by_height(i).expect("block not found").unwrap()
+        ).collect();
 
     // Recover history of total supply
     let mint_hash: ContractHash = {
@@ -1300,7 +1325,7 @@ async fn basic_simple_rewards_test() {
                 .expect("failure to recover total supply")
         })
         .collect();
-*/
+
     // Verify that it "works"
     // TODO: Make this more interesting
     for entry in &bids[ERA_COUNT as usize - 1] {
