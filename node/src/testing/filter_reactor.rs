@@ -35,12 +35,6 @@ impl<R: Reactor> FilterReactor<R> {
     pub(crate) fn inner(&self) -> &R {
         &self.reactor
     }
-
-    /// Activate failpoint disabling finality signature creation
-    pub(crate) fn activate_finality_signature_creation_failpoint(&mut self) {
-        let activation = FailpointActivation::new("finality_signature_creation");
-        self.reactor.activate_failpoint(&activation);
-    }
 }
 
 impl<R: Reactor> Reactor for FilterReactor<R> {
@@ -80,6 +74,10 @@ impl<R: Reactor> Reactor for FilterReactor<R> {
             Either::Left(effects) => effects,
             Either::Right(event) => self.reactor.dispatch_event(effect_builder, rng, event),
         }
+    }
+
+    fn activate_failpoint(&mut self, activation: &FailpointActivation) {
+        self.reactor.activate_failpoint(activation);
     }
 }
 

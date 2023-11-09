@@ -37,7 +37,10 @@ use crate::{components::{
 use crate::components::{block_accumulator, block_synchronizer, Component, deploy_buffer, event_stream_server, shutdown_trigger};
 use crate::components::gossiper::GossipItem;
 use crate::effect::{EffectBuilder, Effects};
+use crate::failpoints::FailpointActivation;
+use crate::reactor::Reactor;
 use crate::types::{BlockWithMetadata, MetaBlock};
+use crate::types::chainspec::ConsensusProtocolName;
 
 struct TestChain {
     // Keys that validator instances will use, can include duplicates
@@ -1143,10 +1146,12 @@ fn handle_meta_block_without_signing(
 }
 
 #[tokio::test]
+#[cfg_attr(not(feature = "failpoints"), ignore)]
 async fn basic_simple_rewards_test() {
     testing::init_logging();
 
     // Constants to "parametrize" the test
+    const CONSENSUS: ConsensusProtocolName = ConsensusProtocolName::Zug;
     const VALIDATOR_SLOTS: u32 = 10;
     const NETWORK_SIZE: u64 = 10;
     const STAKE: u64 = 1000000000;
@@ -1182,6 +1187,7 @@ async fn basic_simple_rewards_test() {
     chain.chainspec_mut().core_config.minimum_era_height = MIN_HEIGHT;
     chain.chainspec_mut().core_config.minimum_block_time = TimeDiff::from_millis(BLOCK_TIME);
     chain.chainspec_mut().core_config.round_seigniorage_rate = Ratio::from(SEIGNIORAGE);
+    chain.chainspec_mut().core_config.consensus_protocol = CONSENSUS;
     chain.chainspec_mut().core_config.finders_fee = Ratio::from(FINDERS_FEE);
     chain.chainspec_mut().core_config.finality_signature_proportion = Ratio::from(FINALITY_SIG_PROP);
 
@@ -1249,7 +1255,7 @@ async fn basic_simple_rewards_test() {
             };
         */
         //filtered_node.reactor_mut().inner_mut().set_filter(filter_closure);
-        filtered_node.reactor_mut().inner_mut().activate_finality_signature_creation_failpoint();
+        filtered_node.reactor_mut().inner_mut().activate_failpoint(&FailpointActivation::new("finality_signature_creation"));
     }
 
     // Run the network for a specified number of eras
