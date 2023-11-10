@@ -1,4 +1,5 @@
 use std::{collections::BTreeMap, iter, sync::Arc, time::Duration};
+use std::cmp::max;
 
 use either::Either;
 use num::Zero;
@@ -36,7 +37,7 @@ use crate::{components::{
 }, utils::{External, Loadable, Source, RESOURCES_PATH}, WithDir};
 use crate::failpoints::FailpointActivation;
 use crate::reactor::Reactor;
-use crate::types::BlockWithMetadata;
+use crate::types::{BlockWithMetadata, SingleBlockRewardedSignatures};
 use crate::types::chainspec::ConsensusProtocolName;
 
 struct TestChain {
@@ -1130,7 +1131,7 @@ async fn basic_parametrized_rewards_test() {
 
     async fn run_rewards_network_scenario(
         consensus: ConsensusProtocolName,
-        stakes: &[u64],
+        initial_stakes: &[u64],
         era_count: u64,
         era_duration: u64, //milliseconds
         min_height: u64,
@@ -1144,18 +1145,22 @@ async fn basic_parametrized_rewards_test() {
 
         testing::init_logging();
 
+        let total_initial_stake = &initial_stakes
+            .iter()
+            .fold(0u64, move |acc, s| acc + s);
+
         // SETUP
         // TODO: Consider fixing the seed
         let mut rng = crate::new_rng();
 
         // Create random keypairs to populate our network
-        let keys: Vec<Arc<SecretKey>> = (1..&stakes.len() + 1)
+        let keys: Vec<Arc<SecretKey>> = (1..&initial_stakes.len() + 1)
             .map(|_| Arc::new(SecretKey::random(&mut rng)))
             .collect();
         let stakes: BTreeMap<PublicKey, U512> = keys
             .iter()
             .enumerate()
-            .map(|(i, secret_key)| (PublicKey::from(&*secret_key.clone()), U512::from(*&stakes[i])))
+            .map(|(i, secret_key)| (PublicKey::from(&*secret_key.clone()), U512::from(*&initial_stakes[i])))
             .collect();
 
         // Instantiate the chain
@@ -1257,6 +1262,123 @@ async fn basic_parametrized_rewards_test() {
                     })
                     .expect("failure to recover total supply")
             })
+            .collect();
+
+        // Tiny helper function
+        #[inline]
+        fn add_to_rewards(recipient: PublicKey, reward: U512, mut rewards: &BTreeMap<PublicKey, U512>) {
+            if let Some(value) = rewards.get_mut(&recipient.clone()) {
+                *value += reward
+            } else {
+                rewards.insert(recipient.clone(), reward).expect("expected proposer to not be present");
+            };
+        }
+
+        let recomputed_rewards = switch_blocks.headers
+            .iter()
+            .enumerate()
+            .map(|(i, switch_block)|
+                if switch_block.is_genesis() || switch_block.height() > highest_completed_height {
+                    return (i, BTreeMap::<PublicKey, U512>::new())
+                } else {
+                    let mut recomputed_era_rewards = BTreeMap::<PublicKey, U512>::new();
+
+                    // It's not a genesis block, so we know there's something with a lower era id
+                    let previous_switch_block_height = switch_blocks.headers[i - 1].height();
+                    let current_era_slated_weights =
+                        match switch_blocks.headers[i - 1].era_end() {
+                            Some(era_report) => era_report.next_era_validator_weights(),
+                            _ => panic!("unexpectedly absent era report"),
+                        };
+                    let total_current_era_weights = current_era_slated_weights
+                        .iter()
+                        .fold(U512::from(0u64), move |acc, s| acc + s.1);
+                    let (previous_era_slated_weights, total_previous_era_weights) =
+                        if switch_blocks.headers[i - 1].is_genesis() {
+                            (None, None)
+                        } else {
+                            match switch_blocks.headers[i - 2].era_end() {
+                                Some(era_report) => {
+                                    let next_weights = era_report.next_era_validator_weights();
+                                    let total_next_weights = next_weights
+                                        .iter()
+                                        .fold(U512::from(0u64), move |acc, s| acc + s.1);
+                                    (Some(next_weights), Some(total_next_weights))},
+                                _ => panic!("unexpectedly absent era report"),
+                            }
+                        };
+                    let era_length = switch_block.height() - previous_switch_block_height;
+                    let last_era_length =
+                        if switch_blocks.headers[i - 1].is_genesis() {
+                            None
+                        } else {
+                            Some(switch_block.height() - switch_blocks.headers[i - 2].height())
+                        };
+                    let total_expected_pot = total_supply[previous_switch_block_height as usize] * chain.chainspec.core_config.minimum_era_height * chain.chainspec.core_config.round_seigniorage_rate;
+                    let total_previous_expected_pot =
+                        if switch_blocks.headers[i - 1].is_genesis() {
+                            None
+                        } else {
+                            total_supply[switch_blocks.headers[i - 2].height()] * chain.chainspec.core_config.minimum_era_height * chain.chainspec.core_config.round_seigniorage_rate
+                        };
+
+                    let rewarded_blocks = blocks[previous_switch_block_height + 1..switch_block.height() + 1];
+                    let block_reward = (Ratio::new(1, 1)
+                        - chain.chainspec.core_config.finality_signature_proportion)
+                        * (total_expected_pot / max(chain.chainspec.core_config.minimum_era_height, era_length));
+                    let signatures_reward = chain.chainspec.core_config.finality_signature_proportion
+                        * (total_expected_pot / max(chain.chainspec.core_config.minimum_era_height, era_length));
+                    let previous_signatures_reward =
+                        if switch_blocks[i - 1].is_genesis() {
+                            None
+                        } else {
+                            Some(chain.chainspec.core_config.finality_signature_proportion
+                                * (total_previous_expected_pot.unwrap() / max(chain.chainspec.core_config.minimum_era_height, last_era_length.unwrap())))
+                        };
+
+                    rewarded_blocks
+                        .iter()
+                        .for_each(|block: BlockWithMetadata| {
+                            // Block production rewards
+                            let proposer = block.block.proposer().clone();
+                            add_to_rewards(proposer.clone(), block_reward, &recomputed_era_rewards);
+
+                            // Recover relevant finality signatures
+                            // TODO: Deal with the implicit assumption that lookback only look backs one previous era
+                            block.block.rewarded_signatures()
+                                .iter()
+                                .enumerate()
+                                .for_each(|(offset, signatures_packed)| {
+                                    if block.block.height() - offset - 1 < previous_switch_block_height {
+                                        let rewarded_contributors = signatures_packed.into_validator_set(previous_era_slated_weights);
+                                        rewarded_contributors
+                                            .iter()
+                                            .for_each(|contributor| {
+                                                let contributor_proportion = previous_era_slated_weights
+                                                    .unwrap()
+                                                    .get(contributor)
+                                                    .expect("expected current era validator")
+                                                    / total_previous_era_weights;
+                                                add_to_rewards(proposer.clone(), chain.chainspec.core_config.finders_fee * contributor_proportion * previous_signatures_reward.unwrap(), &recomputed_era_rewards);
+                                                add_to_rewards(contributor.clone(), (Ratio::new(1, 1) - chain.chainspec.core_config.finders_fee) * contributor_proportion * signatures_reward, &recomputed_era_rewards)
+                                            });
+                                    } else {
+                                        let rewarded_contributors = signatures_packed.into_validator_set(current_era_slated_weights);
+                                        rewarded_contributors
+                                            .iter()
+                                            .for_each(|contributor| {
+                                                let contributor_proportion = current_era_slated_weights
+                                                    .get(contributor)
+                                                    .expect("expected current era validator")
+                                                    / total_current_era_weights;
+                                                add_to_rewards(proposer.clone(), chain.chainspec.core_config.finders_fee * contributor_proportion * signatures_reward, &recomputed_era_rewards);
+                                                add_to_rewards(contributor.clone(), (Ratio::new(1, 1) - chain.chainspec.core_config.finders_fee) * contributor_proportion * signatures_reward, &recomputed_era_rewards)
+                                            });
+                                    }
+                                });
+                        });
+                    return (i, recomputed_era_rewards) }
+            )
             .collect();
 
         // Verify that it "works"
