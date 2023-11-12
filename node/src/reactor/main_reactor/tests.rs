@@ -1269,9 +1269,9 @@ async fn basic_parametrized_rewards_test() {
         #[inline]
         fn add_to_rewards(recipient: PublicKey, reward: Ratio<u64>, rewards: &mut BTreeMap<PublicKey, Ratio<u64>>) {
             if let Some(value) = rewards.get_mut(&recipient.clone()) {
-                *value += reward
+                *value += reward;
             } else {
-                rewards.insert(recipient.clone(), reward).expect("expected recipient to not be present");
+                rewards.insert(recipient.clone(), reward);
             };
         }
 
@@ -1323,6 +1323,7 @@ async fn basic_parametrized_rewards_test() {
                             Some(Ratio::from(total_supply[switch_blocks.headers[i - 2].height() as usize].as_u64() * chain.chainspec.core_config.minimum_era_height) * chain.chainspec.core_config.round_seigniorage_rate)
                         };
 
+                    // TODO: Investigate whether the rewards pay out for the signatures _in the switch block itself_
                     let rewarded_range = previous_switch_block_height as usize + 1..switch_block.height() as usize + 1;
                     let rewarded_blocks = &blocks[rewarded_range];
                     let block_reward = (Ratio::new(1, 1)
