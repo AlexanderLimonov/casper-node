@@ -1295,6 +1295,10 @@ async fn basic_parametrized_rewards_test() {
                     return (i, BTreeMap::<PublicKey, Ratio<u64>>::new())
                 } else {
                     let mut recomputed_era_rewards = BTreeMap::<PublicKey, Ratio<u64>>::new();
+                    if !(switch_block.is_genesis()) {
+                        let supply_carryover = recomputed_total_supply.get(&(&i - &1usize)).expect("expected prior recomputed supply value").clone();
+                        recomputed_total_supply.insert(i, supply_carryover);
+                    }
 
                     // It's not a genesis block, so we know there's something with a lower era id
                     let previous_switch_block_height = switch_blocks.headers[i - 1].height();
